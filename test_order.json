@@ -1,0 +1,60 @@
+{
+  "id": 123456789,
+  "name": "#1001",
+  "email": "customer@example.com",
+  "created_at": "2024-01-15T10:00:00-05:00",
+  "updated_at": "2024-01-15T10:05:00-05:00",
+  "total_price": "109.97",
+  "subtotal_price": "109.97",
+  "total_tax": "0.00",
+  "currency": "USD",
+  "financial_status": "paid",
+  "fulfillment_status": null,
+  "line_items": [
+    {
+      "id": 1,
+      "variant_id": 987654321,
+      "title": "Test Product 1",
+      "quantity": 2,
+      "sku": "TEST-SKU-001",
+      "price": "29.99",
+      "grams": 500,
+      "vendor": "Test Vendor",
+      "product_id": 111222333,
+      "requires_shipping": true,
+      "taxable": true,
+      "fulfillment_status": null
+    },
+    {
+      "id": 2,
+      "variant_id": 987654322,
+      "title": "Test Product 2",
+      "quantity": 1,
+      "sku": "TEST-SKU-002",
+      "price": "49.99",
+      "grams": 1000,
+      "vendor": "Test Vendor",
+      "product_id": 111222334,
+      "requires_shipping": true,
+      "taxable": true,
+      "fulfillment_status": null
+    }
+  ],
+  "shipping_address": {
+    "first_name": "John",
+    "last_name": "Doe",
+    "address1": "123 Test Street",
+    "city": "New York",
+    "province": "NY",
+    "country": "United States",
+    "zip": "10001"
+  },
+  "customer": {
+    "id": 555666777,
+    "email": "customer@example.com",
+    "first_name": "John",
+    "last_name": "Doe",
+    "orders_count": 5,
+    "total_spent": "549.85"
+  }
+}

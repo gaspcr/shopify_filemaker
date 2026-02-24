@@ -1,0 +1,19 @@
+# Core dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+tenacity==8.2.3
+click==8.1.7
+python-dotenv==1.0.1
+pyyaml==6.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Scheduling
+APScheduler==3.10.4
+
+# Shopify API
+ShopifyAPI==12.5.0
+
+# Logging and utilities
+python-json-logger==2.0.7

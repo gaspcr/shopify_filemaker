@@ -1,0 +1,49 @@
+# Application Configuration
+
+# API Settings
+api:
+  timeout: 30  # seconds
+  max_retries: 3
+  retry_delay: 1  # seconds
+  exponential_backoff: true
+
+# Sync Settings
+sync:
+  batch_size: 100  # Number of items per batch update
+  enable_diff_check: true  # Only update items with changed quantities
+  parallel_processing: false  # Enable parallel processing (future)
+
+# Shopify Settings
+shopify:
+  rate_limit_delay: 0.5  # seconds between requests
+  bulk_operation_timeout: 300  # seconds
+  api_version: "2024-01"
+
+# FileMaker Settings
+filemaker:
+  session_timeout: 900  # seconds (15 minutes)
+  auto_refresh_token: true
+
+# Logging Configuration
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+  files:
+    sync: "logs/sync.log"
+    webhook: "logs/webhook.log"
+    error: "logs/error.log"
+
+# Webhook Settings
+webhook:
+  validate_signature: true
+  request_timeout: 30  # seconds
+
+# Scheduler Settings
+scheduler:
+  timezone: "America/New_York"
+  max_instances: 1  # Prevent overlapping sync jobs
+  coalesce: true  # Merge multiple pending executions
+  misfire_grace_time: 300  # seconds
