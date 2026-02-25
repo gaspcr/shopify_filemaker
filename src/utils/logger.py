@@ -45,8 +45,9 @@ def setup_logger(
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # File handler
-    if log_file:
+    # File handler — skipped in production (Railway has ephemeral filesystem;
+    # stdout is captured automatically by the platform).
+    if log_file and not config.is_production:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
