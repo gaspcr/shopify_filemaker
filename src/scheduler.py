@@ -18,7 +18,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from .services.sync_service import SyncService
 from .utils.config import get_config
-from .utils.logger import get_sync_logger
+from .utils.logger import get_sync_logger, get_scheduler_logger
+
+# Ensure APScheduler's internal exceptions are visible in Railway logs.
+get_scheduler_logger()
 
 
 # ------------------------------------------------------------------
@@ -32,9 +35,13 @@ def _make_sync_job():
     sync_service = SyncService()
 
     def sync_job():
+        # Use both logger and print to guarantee visibility in Railway logs
+        import sys
+        print("[SYNC] Job started", flush=True)
         logger.info("=" * 70)
         logger.info(f"Scheduled sync job started at {datetime.now()}")
         logger.info("=" * 70)
+        sys.stdout.flush()
 
         try:
             result = sync_service.execute_filemaker_to_shopify_sync(dry_run=False)
@@ -50,10 +57,14 @@ def _make_sync_job():
             if not result.success:
                 logger.warning(f"Sync completed with {result.failed_count} errors")
 
+            print(f"[SYNC] Job completed — {result.updated_count} updated, {result.failed_count} failed", flush=True)
+
         except Exception as e:
             logger.error(f"Sync job failed with exception: {str(e)}", exc_info=True)
+            print(f"[SYNC] Job FAILED: {str(e)}", flush=True)
 
         logger.info("=" * 70)
+        sys.stdout.flush()
 
     return sync_job
 

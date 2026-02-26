@@ -84,3 +84,12 @@ def get_error_logger() -> logging.Logger:
 def get_api_logger() -> logging.Logger:
     """Get logger for API operations."""
     return setup_logger("api")
+
+
+def get_scheduler_logger() -> logging.Logger:
+    """Get logger for APScheduler internals.
+
+    Without this, APScheduler exceptions in background threads are
+    silently swallowed and never appear in Railway logs.
+    """
+    return setup_logger("apscheduler")
