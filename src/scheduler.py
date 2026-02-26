@@ -73,14 +73,13 @@ def _make_sync_job():
 # Embedded (non-blocking) scheduler — used by the web process
 # ------------------------------------------------------------------
 
-def create_background_scheduler() -> BackgroundScheduler:
+def create_background_scheduler():
     """Create a ``BackgroundScheduler`` for embedding inside FastAPI.
 
-    The scheduler is returned **not started** — the caller must invoke
-    ``scheduler.start()`` when ready.
-
-    An initial sync is scheduled to run 15 seconds after creation so the
-    web server can finish its startup first.
+    Returns:
+        Tuple of (scheduler, sync_job_fn) — the caller should start the
+        scheduler and optionally run sync_job_fn() in a thread for the
+        initial sync.
     """
     config = get_config()
     logger = get_sync_logger()
@@ -101,20 +100,10 @@ def create_background_scheduler() -> BackgroundScheduler:
         replace_existing=True
     )
 
-    # Initial sync shortly after startup
-    scheduler.add_job(
-        func=sync_job,
-        trigger="date",
-        run_date=datetime.now() + timedelta(seconds=15),
-        id="initial_sync",
-        name="Initial sync on startup",
-    )
-
     logger.info(
-        f"Background scheduler configured: sync every {sync_interval} min "
-        f"(initial run in ~15 s)"
+        f"Background scheduler configured: sync every {sync_interval} min"
     )
-    return scheduler
+    return scheduler, sync_job
 
 
 # ------------------------------------------------------------------

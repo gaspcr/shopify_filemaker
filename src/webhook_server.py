@@ -37,6 +37,8 @@ ALLOWED_ORDER_TOPICS = {"orders/create", "orders/paid"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup / shutdown of the application."""
+    import threading
+
     # ── Startup ───────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("FileMaker-Shopify Webhook Server Starting")
@@ -47,10 +49,21 @@ async def lifespan(app: FastAPI):
     logger.info(f"Sync interval:        {config.env.sync_interval_minutes} min")
     logger.info("=" * 60)
 
-    # Start the background sync scheduler
-    scheduler = create_background_scheduler()
+    # Start the background sync scheduler (recurring job)
+    scheduler, sync_job = create_background_scheduler()
     scheduler.start()
     logger.info("Background sync scheduler started")
+
+    # Run initial sync in a separate thread (avoids APScheduler timezone issues)
+    def _initial_sync():
+        import time
+        time.sleep(5)  # Let the server finish starting
+        logger.info("Running initial sync...")
+        print("[SYNC] Running initial sync...", flush=True)
+        sync_job()
+
+    initial_thread = threading.Thread(target=_initial_sync, daemon=True)
+    initial_thread.start()
 
     yield
 
