@@ -17,7 +17,7 @@ sync:
 shopify:
   rate_limit_delay: 0.5  # seconds between requests
   bulk_operation_timeout: 300  # seconds
-  api_version: "2025-01"
+  api_version: "2026-01"
 
 # FileMaker Settings
 filemaker:

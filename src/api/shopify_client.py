@@ -1,4 +1,4 @@
-"""Shopify Admin API client (GraphQL)."""
+"""Shopify Admin REST API client."""
 
 import time
 from typing import List, Dict, Any, Optional
@@ -14,7 +14,7 @@ GID_LOCATION_PREFIX = "gid://shopify/Location/"
 
 
 class ShopifyClient(BaseClient):
-    """Client for the Shopify Admin GraphQL API."""
+    """Client for the Shopify Admin REST API."""
 
     def __init__(self):
         """Initialize Shopify client from environment configuration."""
@@ -35,13 +35,13 @@ class ShopifyClient(BaseClient):
         self.api_version = config.shopify.api_version
         self.rate_limit_delay = config.shopify.rate_limit_delay
 
-        # Normalise location_id to the full GID format regardless of whether
-        # the env var was set as a plain number or a gid:// string.
+        # Normalise location_id to a plain numeric string (REST API
+        # expects a number, not the gid:// format).
         raw_loc = config.env.shopify_location_id
         if raw_loc.startswith(GID_LOCATION_PREFIX):
-            self.location_gid = raw_loc
+            self.location_id = raw_loc[len(GID_LOCATION_PREFIX):]
         else:
-            self.location_gid = f"{GID_LOCATION_PREFIX}{raw_loc}"
+            self.location_id = raw_loc
 
     # ------------------------------------------------------------------
     # Rate-limit handling
@@ -63,136 +63,139 @@ class ShopifyClient(BaseClient):
             raise RateLimitError(f"Rate limited. Retry after {retry_after}s.")
 
     # ------------------------------------------------------------------
-    # Low-level GraphQL helper
+    # Low-level REST helper
     # ------------------------------------------------------------------
 
-    def _graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _rest_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Execute a GraphQL operation and return the ``data`` dict.
+        Execute a GET request against the Shopify Admin REST API.
+
+        Args:
+            path: e.g. "/admin/api/2026-01/variants.json"
+            params: Optional query parameters
+
+        Returns:
+            Parsed JSON response body.
 
         Raises:
-            ShopifyAPIError: On HTTP failure or top-level GraphQL errors.
+            ShopifyAPIError: On HTTP failure or unexpected response.
         """
-        endpoint = f"/admin/api/{self.api_version}/graphql.json"
-        payload: Dict[str, Any] = {"query": query}
-        if variables:
-            payload["variables"] = variables
-
         try:
-            response = self.post(endpoint, json=payload)
+            response = self.get(path, params=params)
             self._handle_rate_limit(response)
 
             if response.status_code != 200:
                 raise ShopifyAPIError(
-                    f"GraphQL request failed (HTTP {response.status_code})",
+                    f"REST GET {path} failed (HTTP {response.status_code})",
                     details={"response": response.text}
                 )
 
-            body = response.json()
-
-            if "errors" in body:
-                errors = body["errors"]
-                # Build a human-readable summary of the errors
-                if isinstance(errors, list):
-                    error_msgs = "; ".join(e.get("message", str(e)) for e in errors)
-                else:
-                    error_msgs = str(errors)
-                self.logger.error(f"GraphQL error details: {error_msgs}")
-                raise ShopifyAPIError(
-                    f"GraphQL errors: {error_msgs}",
-                    details={"errors": errors}
-                )
-
             time.sleep(self.rate_limit_delay)
-            return body.get("data", {})
+            return response.json()
 
         except (ShopifyAPIError, RateLimitError):
             raise
         except httpx.HTTPError as e:
-            raise ShopifyAPIError(f"HTTP error: {str(e)}", details={"error": str(e)})
+            raise ShopifyAPIError(f"HTTP error on GET {path}: {str(e)}")
+
+    def _rest_post(self, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute a POST request against the Shopify Admin REST API.
+
+        Returns:
+            Parsed JSON response body.
+        """
+        try:
+            response = self.post(path, json=json_body)
+            self._handle_rate_limit(response)
+
+            if response.status_code not in (200, 201):
+                raise ShopifyAPIError(
+                    f"REST POST {path} failed (HTTP {response.status_code})",
+                    details={"response": response.text}
+                )
+
+            time.sleep(self.rate_limit_delay)
+            return response.json()
+
+        except (ShopifyAPIError, RateLimitError):
+            raise
+        except httpx.HTTPError as e:
+            raise ShopifyAPIError(f"HTTP error on POST {path}: {str(e)}")
 
     # ------------------------------------------------------------------
     # Inventory queries
     # ------------------------------------------------------------------
 
-    _QUERY_INVENTORY_BY_SKU = """
-    query getInventoryBySKU($sku: String!) {
-      productVariants(first: 1, query: $sku) {
-        edges {
-          node {
-            id
-            sku
-            inventoryItem {
-              id
-              inventoryLevels(first: 5) {
-                edges {
-                  node {
-                    location {
-                      id
-                    }
-                    quantities(names: ["available"]) {
-                      name
-                      quantity
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-
     def get_inventory_by_sku(self, sku: str) -> Optional[StockItem]:
         """
-        Look up the current *available* inventory for a single SKU at the
-        configured location.
+        Look up the current *available* inventory for a single SKU at
+        the configured location using the REST API.
+
+        Step 1: GET /admin/api/{version}/variants.json?sku={sku}
+        Step 2: GET /admin/api/{version}/inventory_levels.json
+                    ?inventory_item_ids={id}&location_ids={loc}
 
         Args:
             sku: Shopify variant SKU — must match the FileMaker
-                 ``Conceptos Cobro_pk`` value exactly (e.g. "852738006010").
+                 ``Conceptos Cobro_pk`` value exactly.
 
         Returns:
-            A ``StockItem`` with the current available quantity, or **None**
-            when the SKU does not exist in Shopify.
+            A StockItem with current available quantity, or None if the
+            SKU does not exist in Shopify.
         """
-        variables = {"sku": f"sku:{sku}"}
+        v = self.api_version
 
+        # ── Step 1: Find the variant by SKU ───────────────────────────
         try:
-            data = self._graphql(self._QUERY_INVENTORY_BY_SKU, variables)
-        except ShopifyAPIError:
+            data = self._rest_get(
+                f"/admin/api/{v}/variants.json",
+                params={"sku": sku}
+            )
+        except ShopifyAPIError as e:
+            self.logger.error(f"Error looking up variant for SKU {sku}: {e.message}")
             raise
-        except Exception as e:
-            raise ShopifyAPIError(f"Failed to query inventory for SKU {sku}: {str(e)}")
 
-        edges = data.get("productVariants", {}).get("edges", [])
-        if not edges:
-            self.logger.warning(f"SKU not found in Shopify: {sku}")
+        variants = data.get("variants", [])
+        if not variants:
+            self.logger.debug(f"SKU not found in Shopify: {sku}")
             return None
 
-        variant = edges[0]["node"]
-        inventory_item = variant.get("inventoryItem", {})
-        levels = inventory_item.get("inventoryLevels", {}).get("edges", [])
+        variant = variants[0]
+        variant_id = variant["id"]
+        inventory_item_id = variant.get("inventory_item_id")
 
-        # Walk inventory levels and find our location
+        if not inventory_item_id:
+            self.logger.warning(f"Variant {variant_id} has no inventory_item_id")
+            return None
+
+        # ── Step 2: Get inventory level at our location ───────────────
+        try:
+            inv_data = self._rest_get(
+                f"/admin/api/{v}/inventory_levels.json",
+                params={
+                    "inventory_item_ids": inventory_item_id,
+                    "location_ids": self.location_id
+                }
+            )
+        except ShopifyAPIError as e:
+            self.logger.error(f"Error fetching inventory level for SKU {sku}: {e.message}")
+            raise
+
+        levels = inv_data.get("inventory_levels", [])
         quantity = 0
-        for level in levels:
-            node = level["node"]
-            if node["location"]["id"] == self.location_gid:
-                for q in node.get("quantities", []):
-                    if q["name"] == "available":
-                        quantity = q["quantity"]
-                        break
-                break
+        if levels:
+            quantity = levels[0].get("available", 0) or 0
 
         return StockItem(
             sku=sku,
             quantity=quantity,
             source="shopify",
             metadata={
-                "variant_id": variant["id"],
-                "inventory_item_id": inventory_item["id"]
+                "variant_id": str(variant_id),
+                "inventory_item_id": str(inventory_item_id),
+                "product_id": str(variant.get("product_id", "")),
+                "title": variant.get("title", ""),
             }
         )
 
@@ -200,29 +203,15 @@ class ShopifyClient(BaseClient):
     # Inventory mutations
     # ------------------------------------------------------------------
 
-    _MUTATION_SET_QUANTITIES = """
-    mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
-      inventorySetQuantities(input: $input) {
-        userErrors {
-          field
-          message
-        }
-        inventoryAdjustmentGroup {
-          id
-        }
-      }
-    }
-    """
-
     def update_inventory(self, sku: str, quantity: int) -> bool:
         """
         Set the *available* inventory for ``sku`` at the configured location.
 
-        Fetches the ``inventoryItemId`` via ``get_inventory_by_sku`` first,
-        then issues the ``inventorySetQuantities`` mutation.
+        Step 1: Fetch inventory_item_id via get_inventory_by_sku(sku)
+        Step 2: POST /admin/api/{version}/inventory_levels/set.json
 
         Args:
-            sku: Shopify variant SKU (= FileMaker ``Conceptos Cobro_pk``).
+            sku: Shopify variant SKU (= FileMaker Conceptos Cobro_pk).
             quantity: Absolute quantity to set.
 
         Returns:
@@ -230,7 +219,7 @@ class ShopifyClient(BaseClient):
 
         Raises:
             SKUNotFoundError: If the SKU does not exist in Shopify.
-            ShopifyAPIError: If the mutation returns ``userErrors``.
+            ShopifyAPIError: If the API rejects the update.
         """
         stock_item = self.get_inventory_by_sku(sku)
         if not stock_item:
@@ -240,36 +229,22 @@ class ShopifyClient(BaseClient):
         if not inventory_item_id:
             raise ShopifyAPIError(f"No inventory item ID for SKU: {sku}")
 
-        variables = {
-            "input": {
-                "reason": "correction",
-                "name": "available",
-                "quantities": [
-                    {
-                        "inventoryItemId": inventory_item_id,
-                        "locationId": self.location_gid,
-                        "quantity": quantity
-                    }
-                ]
-            }
+        v = self.api_version
+
+        body = {
+            "location_id": int(self.location_id),
+            "inventory_item_id": int(inventory_item_id),
+            "available": quantity
         }
 
         try:
-            data = self._graphql(self._MUTATION_SET_QUANTITIES, variables)
-        except ShopifyAPIError:
-            raise
-        except Exception as e:
-            raise ShopifyAPIError(f"Failed to update inventory for {sku}: {str(e)}")
-
-        result = data.get("inventorySetQuantities", {})
-        user_errors = result.get("userErrors", [])
-
-        if user_errors:
-            error_messages = [f"{e.get('field')}: {e.get('message')}" for e in user_errors]
-            raise ShopifyAPIError(
-                f"Shopify rejected inventory update for {sku}",
-                details={"errors": error_messages}
+            result = self._rest_post(
+                f"/admin/api/{v}/inventory_levels/set.json",
+                json_body=body
             )
+        except ShopifyAPIError as e:
+            self.logger.error(f"Failed to update inventory for {sku}: {e.message}")
+            raise
 
         self.logger.info(f"Updated Shopify inventory for {sku}: {quantity}")
         return True
@@ -280,13 +255,13 @@ class ShopifyClient(BaseClient):
 
     def bulk_update_inventory(self, updates: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Call ``update_inventory`` for each item in *updates*.
+        Call update_inventory for each item in *updates*.
 
         Args:
-            updates: List of ``{"sku": "…", "quantity": N}`` dicts.
+            updates: List of {"sku": "…", "quantity": N} dicts.
 
         Returns:
-            ``{"success_count": int, "error_count": int, "errors": [...]}``.
+            {"success_count": int, "error_count": int, "errors": [...]}.
         """
         results: Dict[str, Any] = {
             "success_count": 0,
@@ -309,40 +284,15 @@ class ShopifyClient(BaseClient):
         return results
 
     # ------------------------------------------------------------------
-    # Order query (utility)
+    # Cleanup
     # ------------------------------------------------------------------
 
-    def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch order details by Shopify GraphQL ID.
+    def close(self):
+        """Close the underlying HTTP client."""
+        self.client.close()
 
-        Args:
-            order_id: e.g. ``gid://shopify/Order/123456789``
-        """
-        query = """
-        query getOrder($id: ID!) {
-          order(id: $id) {
-            id
-            name
-            lineItems(first: 50) {
-              edges {
-                node {
-                  sku
-                  quantity
-                  variant {
-                    id
-                  }
-                }
-              }
-            }
-          }
-        }
-        """
+    def __enter__(self):
+        return self
 
-        try:
-            data = self._graphql(query, {"id": order_id})
-            return data.get("order")
-        except ShopifyAPIError:
-            raise
-        except Exception as e:
-            raise ShopifyAPIError(f"Failed to get order {order_id}: {str(e)}")
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
