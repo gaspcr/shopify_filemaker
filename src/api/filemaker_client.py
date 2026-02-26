@@ -197,73 +197,98 @@ class FileMakerClient(BaseClient):
         """
         Fetch all sellable products (Clasificación == "8") from FileMaker.
 
+        FileMaker Data API returns a maximum of 100 records per request,
+        so this method paginates automatically until all records are fetched.
+
         Returns:
             List of StockItem objects, one per product
 
         Raises:
             FileMakerAPIError: If the request fails
         """
-        self.logger.info("Fetching all stock from FileMaker...")
+        self.logger.info("Fetching all stock from FileMaker (paginated)...")
 
         endpoint = f"/fmi/data/v1/databases/{self.database}/layouts/{STOCK_LAYOUT}/_find"
-        payload = {"query": [{"Clasificación": "8"}]}
-
-        try:
-            response = self._fm_request("POST", endpoint, json=payload)
-        except httpx.HTTPError as e:
-            raise FileMakerAPIError(
-                f"Network error fetching stock: {str(e)}",
-                details={"error": str(e)}
-            )
-
-        if response.status_code != 200:
-            raise FileMakerAPIError(
-                f"Unexpected HTTP {response.status_code} fetching stock",
-                details={"response": response.text}
-            )
-
-        data = response.json()
-        code = _fm_code(data)
-
-        if code == "401":
-            # FM "No records match the request" — treat as empty, not an error
-            self.logger.warning("No stock records found with Clasificación=8")
-            return []
-
-        if code != "0":
-            raise FileMakerAPIError(
-                f"FileMaker error fetching stock: {_fm_message(data)}",
-                details={"code": code}
-            )
-
-        records = data["response"]["data"]
+        page_size = 100
+        offset = 1  # FM uses 1-based offsets
         stock_items: List[StockItem] = []
 
-        for record in records:
-            fields = record["fieldData"]
+        while True:
+            payload = {
+                "query": [{"Clasificación": "8"}],
+                "limit": str(page_size),
+                "offset": str(offset),
+            }
 
-            # Conceptos Cobro_pk is the product identifier used as SKU
-            sku = str(fields["Conceptos Cobro_pk"])
+            try:
+                response = self._fm_request("POST", endpoint, json=payload)
+            except httpx.HTTPError as e:
+                raise FileMakerAPIError(
+                    f"Network error fetching stock (offset={offset}): {str(e)}",
+                    details={"error": str(e)}
+                )
 
-            # Inventario may come back as int, float, str, or None
-            raw_inv = fields.get("Inventario")
-            quantity = int(float(raw_inv)) if raw_inv not in (None, "", 0.0) else 0
-            # Ensure non-negative (FM can store negative stock in edge cases)
-            quantity = max(0, quantity)
+            if response.status_code != 200:
+                raise FileMakerAPIError(
+                    f"Unexpected HTTP {response.status_code} fetching stock",
+                    details={"response": response.text}
+                )
 
-            stock_items.append(StockItem(
-                sku=sku,
-                quantity=quantity,
-                source="filemaker",
-                metadata={
-                    "record_id": record["recordId"],
-                    "nombre": fields.get("Nombre", ""),
-                    "valor": fields.get("Valor"),
-                    "clasificacion": fields.get("Clasificación", "")
-                }
-            ))
+            data = response.json()
+            code = _fm_code(data)
 
-        self.logger.info(f"Fetched {len(stock_items)} stock items from FileMaker")
+            if code == "401":
+                # FM "No records match the request"
+                if not stock_items:
+                    self.logger.warning("No stock records found with Clasificación=8")
+                break  # No more records
+
+            if code != "0":
+                raise FileMakerAPIError(
+                    f"FileMaker error fetching stock: {_fm_message(data)}",
+                    details={"code": code}
+                )
+
+            records = data["response"]["data"]
+            if not records:
+                break
+
+            for record in records:
+                fields = record["fieldData"]
+
+                # Conceptos Cobro_pk is the product identifier used as SKU
+                sku = str(fields["Conceptos Cobro_pk"])
+
+                # Inventario may come back as int, float, str, or None
+                raw_inv = fields.get("Inventario")
+                quantity = int(float(raw_inv)) if raw_inv not in (None, "", 0.0) else 0
+                # Ensure non-negative (FM can store negative stock in edge cases)
+                quantity = max(0, quantity)
+
+                stock_items.append(StockItem(
+                    sku=sku,
+                    quantity=quantity,
+                    source="filemaker",
+                    metadata={
+                        "record_id": record["recordId"],
+                        "nombre": fields.get("Nombre", ""),
+                        "valor": fields.get("Valor"),
+                        "clasificacion": fields.get("Clasificación", "")
+                    }
+                ))
+
+            self.logger.info(
+                f"Fetched page {(offset - 1) // page_size + 1}: "
+                f"{len(records)} records (total so far: {len(stock_items)})"
+            )
+
+            # If we got fewer records than page_size, we're done
+            if len(records) < page_size:
+                break
+
+            offset += page_size
+
+        self.logger.info(f"Fetched {len(stock_items)} total stock items from FileMaker")
         return stock_items
 
     def get_stock_by_sku(self, sku: str) -> Optional[StockItem]:

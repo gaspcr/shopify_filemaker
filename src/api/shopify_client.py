@@ -91,9 +91,16 @@ class ShopifyClient(BaseClient):
             body = response.json()
 
             if "errors" in body:
+                errors = body["errors"]
+                # Build a human-readable summary of the errors
+                if isinstance(errors, list):
+                    error_msgs = "; ".join(e.get("message", str(e)) for e in errors)
+                else:
+                    error_msgs = str(errors)
+                self.logger.error(f"GraphQL error details: {error_msgs}")
                 raise ShopifyAPIError(
-                    "GraphQL errors",
-                    details={"errors": body["errors"]}
+                    f"GraphQL errors: {error_msgs}",
+                    details={"errors": errors}
                 )
 
             time.sleep(self.rate_limit_delay)
