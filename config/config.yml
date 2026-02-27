@@ -49,6 +49,6 @@ scheduler:
   misfire_grace_time: 300  # seconds
 
   # Nightly sync schedule — easy to modify for testing
-  nightly_sync_hour: 15    # Hour to run the full nightly sync (0-23)
-  nightly_sync_minute: 40
+  nightly_sync_hour: 23    # Hour to run the full nightly sync (0-23)
+  nightly_sync_minute: 00
 
