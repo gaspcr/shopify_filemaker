@@ -1,20 +1,19 @@
-"""Background scheduler for periodic synchronization.
+"""Background scheduler for nightly synchronization.
 
-Supports two modes:
-  - **Standalone** (``python -m src.scheduler``): runs a ``BlockingScheduler``
-    as a separate worker process — useful during development.
-  - **Embedded** (``create_background_scheduler()``): returns a
-    ``BackgroundScheduler`` that the FastAPI web process starts in its
-    ``lifespan`` handler — this is the Railway production setup.
+Single nightly job at a configurable hour (default 22:00 America/Santiago):
+  1. Fetch all products from FM.
+  2. Recalculate stock for each product.
+  3. Re-fetch updated stock.
+  4. Update Shopify inventory.
 """
 
 import sys
 import signal
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 from .services.sync_service import SyncService
 from .utils.config import get_config
@@ -25,104 +24,101 @@ get_scheduler_logger()
 
 
 # ------------------------------------------------------------------
-# Shared sync-job factory
+# Nightly sync job
 # ------------------------------------------------------------------
 
-def _make_sync_job():
-    """Create and return the sync-job callable."""
-    config = get_config()
+def _make_nightly_job():
+    """Create the nightly FM → Shopify sync job callable."""
     logger = get_sync_logger()
     sync_service = SyncService()
 
-    def sync_job():
-        # Use both logger and print to guarantee visibility in Railway logs
+    def nightly_job():
         import sys
-        print("[SYNC] Job started", flush=True)
+        print("[NIGHTLY] Nightly FM → Shopify sync started", flush=True)
         logger.info("=" * 70)
-        logger.info(f"Scheduled sync job started at {datetime.now()}")
+        logger.info(f"Nightly sync job started at {datetime.now()}")
         logger.info("=" * 70)
         sys.stdout.flush()
 
         try:
-            result = sync_service.execute_filemaker_to_shopify_sync(dry_run=False)
+            result = sync_service.execute_nightly_sync()
 
-            logger.info("Sync job completed:")
+            logger.info("Nightly job completed:")
             logger.info(f"  Total items:  {result.total_items}")
             logger.info(f"  Updated:      {result.updated_count}")
             logger.info(f"  Failed:       {result.failed_count}")
             logger.info(f"  Skipped:      {result.skipped_count}")
             logger.info(f"  Duration:     {result.duration:.2f}s")
-            logger.info(f"  Success rate: {result.success_rate:.2f}%")
 
             if not result.success:
-                logger.warning(f"Sync completed with {result.failed_count} errors")
+                logger.warning(f"Nightly sync completed with errors")
 
-            print(f"[SYNC] Job completed — {result.updated_count} updated, {result.failed_count} failed", flush=True)
+            print(
+                f"[NIGHTLY] Done — {result.updated_count} updated, "
+                f"{result.failed_count} failed, {result.skipped_count} unchanged",
+                flush=True,
+            )
 
         except Exception as e:
-            logger.error(f"Sync job failed with exception: {str(e)}", exc_info=True)
-            print(f"[SYNC] Job FAILED: {str(e)}", flush=True)
+            logger.error(f"Nightly job failed: {str(e)}", exc_info=True)
+            print(f"[NIGHTLY] Job FAILED: {str(e)}", flush=True)
 
         logger.info("=" * 70)
         sys.stdout.flush()
 
-    return sync_job
+    return nightly_job
 
 
 # ------------------------------------------------------------------
 # Embedded (non-blocking) scheduler — used by the web process
 # ------------------------------------------------------------------
 
-def create_background_scheduler():
-    """Create a ``BackgroundScheduler`` for embedding inside FastAPI.
+def create_background_scheduler() -> BackgroundScheduler:
+    """Create a ``BackgroundScheduler`` with the nightly sync job.
 
-    Returns:
-        Tuple of (scheduler, sync_job_fn) — the caller should start the
-        scheduler and optionally run sync_job_fn() in a thread for the
-        initial sync.
+    Returns the scheduler (not started).
     """
     config = get_config()
     logger = get_sync_logger()
-    sync_interval = config.env.sync_interval_minutes
+    sc = config.scheduler
 
-    scheduler = BackgroundScheduler(timezone=config.scheduler.timezone)
-    sync_job = _make_sync_job()
+    scheduler = BackgroundScheduler(timezone=sc.timezone)
 
-    # Recurring job
     scheduler.add_job(
-        func=sync_job,
-        trigger=IntervalTrigger(minutes=sync_interval),
-        id="filemaker_shopify_sync",
-        name="FileMaker to Shopify Stock Sync",
-        max_instances=config.scheduler.max_instances,
-        coalesce=config.scheduler.coalesce,
-        misfire_grace_time=config.scheduler.misfire_grace_time,
-        replace_existing=True
+        func=_make_nightly_job(),
+        trigger=CronTrigger(
+            hour=sc.nightly_sync_hour,
+            minute=sc.nightly_sync_minute,
+            timezone=sc.timezone,
+        ),
+        id="nightly_fm_shopify_sync",
+        name="Nightly FM → Shopify Sync",
+        max_instances=sc.max_instances,
+        coalesce=sc.coalesce,
+        misfire_grace_time=sc.misfire_grace_time,
+        replace_existing=True,
     )
 
     logger.info(
-        f"Background scheduler configured: sync every {sync_interval} min"
+        f"Nightly scheduler configured ({sc.timezone}): "
+        f"sync @ {sc.nightly_sync_hour:02d}:{sc.nightly_sync_minute:02d}"
     )
-    return scheduler, sync_job
+    return scheduler
 
 
 # ------------------------------------------------------------------
-# Standalone (blocking) scheduler — for local development / workers
+# Standalone (blocking) scheduler — for local development
 # ------------------------------------------------------------------
 
 class SyncScheduler:
-    """Scheduler for periodic FileMaker to Shopify synchronization."""
+    """Standalone scheduler for nightly sync."""
 
     def __init__(self):
-        """Initialize scheduler."""
         self.config = get_config()
         self.logger = get_sync_logger()
-        self.sync_job = _make_sync_job()
+        sc = self.config.scheduler
 
-        self.scheduler = BlockingScheduler(
-            timezone=self.config.scheduler.timezone
-        )
-
+        self.scheduler = BlockingScheduler(timezone=sc.timezone)
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
 
@@ -132,33 +128,32 @@ class SyncScheduler:
         sys.exit(0)
 
     def start(self):
-        """Start the blocking scheduler (runs forever)."""
-        sync_interval_minutes = self.config.env.sync_interval_minutes
+        sc = self.config.scheduler
 
         self.logger.info("=" * 70)
-        self.logger.info("FileMaker-Shopify Sync Scheduler Starting (standalone)")
+        self.logger.info("Nightly Scheduler Starting (standalone)")
         self.logger.info("=" * 70)
-        self.logger.info(f"Environment:      {self.config.env.environment}")
-        self.logger.info(f"Timezone:         {self.config.scheduler.timezone}")
-        self.logger.info(f"Sync interval:    {sync_interval_minutes} minutes")
-        self.logger.info(f"Max instances:    {self.config.scheduler.max_instances}")
-        self.logger.info(f"Coalesce:         {self.config.scheduler.coalesce}")
+        self.logger.info(f"Environment:    {self.config.env.environment}")
+        self.logger.info(f"Timezone:       {sc.timezone}")
+        self.logger.info(
+            f"Nightly sync:   {sc.nightly_sync_hour:02d}:{sc.nightly_sync_minute:02d}"
+        )
         self.logger.info("=" * 70)
 
         self.scheduler.add_job(
-            func=self.sync_job,
-            trigger=IntervalTrigger(minutes=sync_interval_minutes),
-            id="filemaker_shopify_sync",
-            name="FileMaker to Shopify Stock Sync",
-            max_instances=self.config.scheduler.max_instances,
-            coalesce=self.config.scheduler.coalesce,
-            misfire_grace_time=self.config.scheduler.misfire_grace_time,
-            replace_existing=True
+            func=_make_nightly_job(),
+            trigger=CronTrigger(
+                hour=sc.nightly_sync_hour,
+                minute=sc.nightly_sync_minute,
+                timezone=sc.timezone,
+            ),
+            id="nightly_fm_shopify_sync",
+            name="Nightly FM → Shopify Sync",
+            max_instances=sc.max_instances,
+            coalesce=sc.coalesce,
+            misfire_grace_time=sc.misfire_grace_time,
+            replace_existing=True,
         )
-
-        self.logger.info(f"Scheduled job: sync every {sync_interval_minutes} minutes")
-        self.logger.info("Running initial sync job...")
-        self.sync_job()
 
         self.logger.info("Scheduler started. Press Ctrl+C to stop.")
         self.logger.info("=" * 70)
@@ -170,7 +165,6 @@ class SyncScheduler:
 
 
 def main():
-    """Main entry point for standalone scheduler."""
     try:
         scheduler = SyncScheduler()
         scheduler.start()

@@ -62,10 +62,14 @@ class WebhookConfig(BaseModel):
 
 class SchedulerConfig(BaseModel):
     """Scheduler configuration."""
-    timezone: str = "America/New_York"
+    timezone: str = "America/Santiago"
     max_instances: int = 1
     coalesce: bool = True
     misfire_grace_time: int = 300
+
+    # Nightly sync schedule — easy to modify for testing
+    nightly_sync_hour: int = 22
+    nightly_sync_minute: int = 0
 
 
 class YAMLConfig(BaseModel):

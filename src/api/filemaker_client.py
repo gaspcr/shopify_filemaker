@@ -190,7 +190,291 @@ class FileMakerClient(BaseClient):
         return response
 
     # ------------------------------------------------------------------
-    # Stock retrieval
+    # Script execution
+    # ------------------------------------------------------------------
+
+    def run_script(
+        self,
+        layout: str,
+        script_name: str,
+        script_param: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run a FileMaker script via the Data API.
+
+        GET /fmi/data/v1/databases/{db}/layouts/{layout}/script/{script_name}
+
+        Args:
+            layout: The layout context for the script.
+            script_name: Name of the FileMaker script to execute.
+            script_param: Optional parameter to pass to the script.
+
+        Returns:
+            Parsed response body from FileMaker.
+
+        Raises:
+            FileMakerAPIError: If the request fails.
+        """
+        import urllib.parse
+
+        encoded_script = urllib.parse.quote(script_name, safe="")
+        endpoint = (
+            f"/fmi/data/v1/databases/{self.database}"
+            f"/layouts/{layout}/script/{encoded_script}"
+        )
+
+        params: Dict[str, str] = {}
+        if script_param is not None:
+            params["script.param"] = script_param
+
+        self.logger.info(
+            f"Running FM script '{script_name}' on layout '{layout}'"
+            + (f" with param '{script_param}'" if script_param else "")
+        )
+
+        try:
+            response = self._fm_request("GET", endpoint, params=params)
+        except httpx.HTTPError as e:
+            raise FileMakerAPIError(
+                f"Network error running script '{script_name}': {str(e)}",
+                details={"error": str(e)},
+            )
+
+        if response.status_code != 200:
+            raise FileMakerAPIError(
+                f"Unexpected HTTP {response.status_code} running script",
+                details={"response": response.text},
+            )
+
+        data = response.json()
+        code = _fm_code(data)
+
+        if code != "0":
+            raise FileMakerAPIError(
+                f"FM script error: {_fm_message(data)}",
+                details={"code": code},
+            )
+
+        self.logger.info(f"FM script '{script_name}' completed successfully")
+        return data.get("response", {})
+
+    # ------------------------------------------------------------------
+    # New architecture methods
+    # ------------------------------------------------------------------
+
+    def get_all_products(self) -> List[Dict[str, str]]:
+        """
+        Fetch all product SKUs with Clasificación == "8" from FileMaker.
+
+        Returns:
+            List of {"sku": "...", "name": "..."} dicts.
+        """
+        self.logger.info("Fetching all product SKUs from FileMaker (paginated)...")
+
+        endpoint = f"/fmi/data/v1/databases/{self.database}/layouts/{STOCK_LAYOUT}/_find"
+        page_size = 100
+        offset = 1
+        products: List[Dict[str, str]] = []
+
+        while True:
+            payload = {
+                "query": [{"Clasificación": "8"}],
+                "limit": str(page_size),
+                "offset": str(offset),
+            }
+
+            try:
+                response = self._fm_request("POST", endpoint, json=payload)
+            except httpx.HTTPError as e:
+                raise FileMakerAPIError(
+                    f"Network error fetching products (offset={offset}): {str(e)}",
+                    details={"error": str(e)}
+                )
+
+            if response.status_code != 200:
+                raise FileMakerAPIError(
+                    f"Unexpected HTTP {response.status_code} fetching products",
+                    details={"response": response.text}
+                )
+
+            data = response.json()
+            code = _fm_code(data)
+
+            if code == "401":  # No records match
+                break
+            if code != "0":
+                raise FileMakerAPIError(
+                    f"FileMaker error: {_fm_message(data)}", details={"code": code}
+                )
+
+            records = data["response"]["data"]
+            if not records:
+                break
+
+            for record in records:
+                fields = record["fieldData"]
+                products.append({
+                    "sku": str(fields["Conceptos Cobro_pk"]),
+                    "name": fields.get("Nombre", ""),
+                })
+
+            self.logger.info(
+                f"Fetched page {(offset - 1) // page_size + 1}: "
+                f"{len(records)} records (total so far: {len(products)})"
+            )
+
+            if len(records) < page_size:
+                break
+            offset += page_size
+
+        self.logger.info(f"Fetched {len(products)} product SKUs from FileMaker")
+        return products
+
+    def recalculate_stock(self, sku: str) -> None:
+        """
+        Execute the ActualizarStock_dapi script for a specific product.
+
+        GET .../layouts/MovimientoStock_dapi/script/ActualizarStock_dapi?script.param={sku}
+
+        Raises:
+            FileMakerAPIError: If the script fails or returns a non-zero scriptError.
+        """
+        import urllib.parse
+
+        script_name = "ActualizarStock_dapi"
+        encoded = urllib.parse.quote(script_name, safe="")
+        endpoint = (
+            f"/fmi/data/v1/databases/{self.database}"
+            f"/layouts/{MOVEMENTS_LAYOUT}/script/{encoded}"
+        )
+
+        try:
+            response = self._fm_request(
+                "GET", endpoint, params={"script.param": sku}
+            )
+        except httpx.HTTPError as e:
+            raise FileMakerAPIError(
+                f"Network error running recalc for SKU {sku}: {str(e)}",
+                details={"sku": sku, "error": str(e)},
+            )
+
+        if response.status_code != 200:
+            raise FileMakerAPIError(
+                f"HTTP {response.status_code} running recalc for SKU {sku}",
+                details={"sku": sku, "response": response.text},
+            )
+
+        data = response.json()
+        script_error = data.get("response", {}).get("scriptError", "")
+        if script_error != "0":
+            raise FileMakerAPIError(
+                f"Recalc script error for SKU {sku}: scriptError={script_error}",
+                details={"sku": sku, "script_error": script_error},
+            )
+
+    def get_stock(self, sku: str) -> int:
+        """
+        Fetch the current Inventario for a specific product by its SKU.
+
+        POST .../layouts/StockInventario_dapi/_find
+        Body: {"query": [{"Conceptos Cobro_pk": "{sku}"}]}
+
+        Returns:
+            The Inventario value (clamped to >= 0).
+
+        Raises:
+            FileMakerAPIError: If the product is not found or the request fails.
+        """
+        endpoint = f"/fmi/data/v1/databases/{self.database}/layouts/{STOCK_LAYOUT}/_find"
+        payload = {"query": [{"Conceptos Cobro_pk": sku}]}
+
+        try:
+            response = self._fm_request("POST", endpoint, json=payload)
+        except httpx.HTTPError as e:
+            raise FileMakerAPIError(
+                f"Network error fetching stock for SKU {sku}: {str(e)}",
+                details={"sku": sku, "error": str(e)},
+            )
+
+        if response.status_code != 200:
+            raise FileMakerAPIError(
+                f"HTTP {response.status_code} fetching stock for SKU {sku}",
+                details={"sku": sku, "response": response.text},
+            )
+
+        data = response.json()
+        code = _fm_code(data)
+
+        if code == "401":
+            raise FileMakerAPIError(
+                f"Product not found in FM for SKU {sku}",
+                details={"sku": sku},
+            )
+        if code != "0":
+            raise FileMakerAPIError(
+                f"FM error fetching stock for SKU {sku}: {_fm_message(data)}",
+                details={"code": code},
+            )
+
+        fields = data["response"]["data"][0]["fieldData"]
+        raw_inv = fields.get("Inventario")
+        quantity = int(float(raw_inv)) if raw_inv not in (None, "", 0.0) else 0
+        return max(0, quantity)
+
+    def create_movement(self, sku: str, quantity_out: int) -> None:
+        """
+        Create a stock exit (salida) movement record in FileMaker.
+
+        POST .../layouts/MovimientoStock_dapi/records
+        Body: {"fieldData": {"Concepto Cobro_fk": sku,
+                             "Inv_Cant_Salida": quantity_out,
+                             "Inv_Cant_Entrada": 0}}
+
+        Args:
+            sku: Conceptos Cobro_pk.
+            quantity_out: Number of units sold (positive integer).
+
+        Raises:
+            FileMakerAPIError: If record creation fails.
+        """
+        endpoint = (
+            f"/fmi/data/v1/databases/{self.database}"
+            f"/layouts/{MOVEMENTS_LAYOUT}/records"
+        )
+        payload = {
+            "fieldData": {
+                "Concepto Cobro_fk": int(sku),
+                "Inv_Cant_Salida": quantity_out,
+                "Inv_Cant_Entrada": 0,
+            }
+        }
+
+        try:
+            response = self._fm_request("POST", endpoint, json=payload)
+        except httpx.HTTPError as e:
+            raise FileMakerAPIError(
+                f"Network error creating movement for SKU {sku}: {str(e)}",
+                details={"sku": sku, "error": str(e)},
+            )
+
+        if response.status_code != 200:
+            raise FileMakerAPIError(
+                f"HTTP {response.status_code} creating movement for SKU {sku}",
+                details={"sku": sku, "response": response.text},
+            )
+
+        data = response.json()
+        code = _fm_code(data)
+        if code != "0":
+            raise FileMakerAPIError(
+                f"FM error creating movement for SKU {sku}: {_fm_message(data)}",
+                details={"code": code},
+            )
+
+        self.logger.info(f"Movement record created for SKU {sku} (salida: {quantity_out})")
+
+    # ------------------------------------------------------------------
+    # Legacy stock retrieval (still used internally)
     # ------------------------------------------------------------------
 
     def get_all_stock(self) -> List[StockItem]:

@@ -43,7 +43,12 @@ webhook:
 
 # Scheduler Settings
 scheduler:
-  timezone: "America/New_York"
+  timezone: "America/Santiago"
   max_instances: 1  # Prevent overlapping sync jobs
   coalesce: true  # Merge multiple pending executions
   misfire_grace_time: 300  # seconds
+
+  # Nightly sync schedule — easy to modify for testing
+  nightly_sync_hour: 15    # Hour to run the full nightly sync (0-23)
+  nightly_sync_minute: 40
+

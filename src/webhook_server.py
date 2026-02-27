@@ -37,8 +37,6 @@ ALLOWED_ORDER_TOPICS = {"orders/create", "orders/paid"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup / shutdown of the application."""
-    import threading
-
     # ── Startup ───────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("FileMaker-Shopify Webhook Server Starting")
@@ -46,29 +44,21 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment:          {config.env.environment}")
     logger.info(f"Port:                 {config.env.port}")
     logger.info(f"Webhook validation:   {config.webhook.validate_signature}")
-    logger.info(f"Sync interval:        {config.env.sync_interval_minutes} min")
+    sc = config.scheduler
+    logger.info(
+        f"Nightly sync:         @ {sc.nightly_sync_hour:02d}:{sc.nightly_sync_minute:02d} ({sc.timezone})"
+    )
     logger.info("=" * 60)
 
-    # Start the background sync scheduler (recurring job)
-    scheduler, sync_job = create_background_scheduler()
+    # Start the background nightly scheduler
+    scheduler = create_background_scheduler()
     scheduler.start()
-    logger.info("Background sync scheduler started")
-
-    # Run initial sync in a separate thread (avoids APScheduler timezone issues)
-    def _initial_sync():
-        import time
-        time.sleep(5)  # Let the server finish starting
-        logger.info("Running initial sync...")
-        print("[SYNC] Running initial sync...", flush=True)
-        sync_job()
-
-    initial_thread = threading.Thread(target=_initial_sync, daemon=True)
-    initial_thread.start()
+    logger.info("Nightly scheduler started")
 
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────
-    logger.info("Shutting down background scheduler...")
+    logger.info("Shutting down nightly scheduler...")
     scheduler.shutdown(wait=True)
     logger.info("Webhook server shut down.")
 
