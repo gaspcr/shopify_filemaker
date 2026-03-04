@@ -5,6 +5,8 @@ process so that a single service handles both webhooks and periodic syncs.
 """
 
 import json
+import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Any
@@ -25,9 +27,30 @@ logger = get_webhook_logger()
 webhook_validator = WebhookValidator()
 
 # Webhook topics we actually want to process (stock decrements).
-# Other order topics (e.g. orders/cancelled, orders/updated) are
-# acknowledged but NOT processed to avoid incorrect stock changes.
-ALLOWED_ORDER_TOPICS = {"orders/create", "orders/paid"}
+# Only orders/create — NOT orders/paid — to avoid processing the same
+# order twice (Shopify fires both topics for a single purchase).
+ALLOWED_ORDER_TOPICS = {"orders/create"}
+
+# ── Idempotency guard ─────────────────────────────────────────────
+# Shopify guarantees "at-least-once" delivery, so the same webhook may
+# arrive multiple times.  We track recently processed order IDs in
+# memory to skip duplicates.  An OrderedDict acts as an LRU with a
+# configurable max size so memory stays bounded.
+_MAX_PROCESSED = 1000
+_processed_orders: OrderedDict = OrderedDict()
+_processed_lock = threading.Lock()
+
+
+def _mark_processed(order_id: int) -> bool:
+    """Mark an order as processed.  Returns True if it was NEW."""
+    with _processed_lock:
+        if order_id in _processed_orders:
+            return False  # duplicate
+        _processed_orders[order_id] = True
+        # Evict oldest entries when we exceed the cap
+        while len(_processed_orders) > _MAX_PROCESSED:
+            _processed_orders.popitem(last=False)
+        return True
 
 
 # ------------------------------------------------------------------
@@ -168,6 +191,19 @@ async def shopify_order_webhook(request: Request, background_tasks: BackgroundTa
     order_id = webhook_data.get("id")
     order_name = webhook_data.get("name")
     logger.info(f"Processing order: {order_name} (ID: {order_id})")
+
+    # ── Idempotency check ─────────────────────────────────────────────
+    if not _mark_processed(order_id):
+        logger.info(f"DUPLICATE — order {order_name} (ID: {order_id}) already processed, skipping")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "duplicate",
+                "order_id": order_id,
+                "order_name": order_name,
+                "message": "Order already processed (duplicate webhook)"
+            }
+        )
 
     # Process webhook in background
     background_tasks.add_task(process_order_in_background, webhook_data)
