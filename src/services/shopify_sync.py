@@ -154,6 +154,165 @@ class ShopifySyncService:
         )
 
     # ------------------------------------------------------------------
+    # Refund / return processing
+    # ------------------------------------------------------------------
+
+    def process_refund_webhook(self, webhook_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a Shopify refund webhook and restock items in FileMaker.
+
+        For each refund_line_item with restock_type 'return' or 'cancel':
+          1. create_entry_movement(sku, quantity)
+          2. recalculate_stock(sku)
+          3. get_stock(sku) → new_quantity
+          4. shopify.update_inventory(sku, new_quantity)
+
+        Args:
+            webhook_data: Parsed JSON body from the Shopify refund webhook.
+
+        Returns:
+            Dict with success flag, counts, and any per-item errors.
+        """
+        result: Dict[str, Any] = {
+            "success": True,
+            "refund_id": None,
+            "order_id": None,
+            "items_processed": 0,
+            "items_skipped": 0,
+            "errors": [],
+        }
+
+        try:
+            refund_id = webhook_data.get("id")
+            order_id = webhook_data.get("order_id")
+            result["refund_id"] = refund_id
+            result["order_id"] = order_id
+
+            self.logger.info(
+                f"Processing refund webhook: refund {refund_id} for order {order_id}"
+            )
+
+            refund_line_items = webhook_data.get("refund_line_items", [])
+            if not refund_line_items:
+                self.logger.warning(f"No refund line items in refund {refund_id}")
+                return result
+
+            self.logger.info(
+                f"Found {len(refund_line_items)} refund line items in refund {refund_id}"
+            )
+
+            # Authenticate FM once for the whole refund
+            self.fm.authenticate()
+
+            for item in refund_line_items:
+                restock_type = item.get("restock_type", "no_restock")
+                quantity = item.get("quantity", 0)
+                line_item = item.get("line_item", {})
+                sku = line_item.get("sku")
+                title = line_item.get("title", "?")
+
+                # Only restock if items are actually being returned/cancelled
+                if restock_type == "no_restock":
+                    self.logger.info(
+                        f"  Skipping {title} (SKU: {sku}) — restock_type=no_restock"
+                    )
+                    result["items_skipped"] += 1
+                    continue
+
+                if not sku:
+                    self.logger.warning(
+                        f"  Refund line item '{title}' has no SKU — skipping"
+                    )
+                    continue
+
+                if quantity <= 0:
+                    self.logger.warning(
+                        f"  Skipping {sku}: invalid quantity {quantity}"
+                    )
+                    continue
+
+                try:
+                    self._process_refund_line_item(
+                        sku, quantity, restock_type, refund_id, title
+                    )
+                    result["items_processed"] += 1
+                except Exception as e:
+                    error_msg = (
+                        f"Failed restocking SKU {sku} ({title}) "
+                        f"in refund {refund_id}: {str(e)}"
+                    )
+                    self.logger.error(error_msg)
+                    self.error_logger.error(error_msg)
+                    result["errors"].append({"sku": sku, "title": title, "error": str(e)})
+
+            result["success"] = len(result["errors"]) == 0
+
+            if result["success"]:
+                self.logger.info(
+                    f"Refund {refund_id} fully processed — "
+                    f"{result['items_processed']} item(s) restocked, "
+                    f"{result['items_skipped']} skipped"
+                )
+            else:
+                self.logger.warning(
+                    f"Refund {refund_id} processed with {len(result['errors'])} error(s)"
+                )
+
+        except Exception as e:
+            self.logger.error(
+                f"Unexpected error processing refund webhook: {str(e)}",
+                exc_info=True,
+            )
+            result["success"] = False
+            result["errors"].append({"error": str(e), "type": type(e).__name__})
+
+        return result
+
+    def _process_refund_line_item(
+        self,
+        sku: str,
+        quantity: int,
+        restock_type: str,
+        refund_id: int,
+        title: str,
+    ) -> None:
+        """
+        Process a single refund line item through the 4-step restock flow.
+
+        Args:
+            sku: Product SKU.
+            quantity: Number of units being returned.
+            restock_type: 'return' or 'cancel'.
+            refund_id: Shopify refund ID (for logging).
+            title: Product title (for logging).
+        """
+        self.logger.info(
+            f"  [{sku}] {title} — restocking {quantity} unit(s) "
+            f"(type: {restock_type}, refund {refund_id})"
+        )
+
+        # Step 1: Create entry movement record in FM
+        self.logger.info(f"  [{sku}] Step 1/4: Creating entry movement (entrada: {quantity})")
+        self.fm.create_entry_movement(sku, quantity_in=quantity)
+
+        # Step 2: Run recalculation script
+        self.logger.info(f"  [{sku}] Step 2/4: Running ActualizarStock_dapi")
+        self.fm.recalculate_stock(sku)
+
+        # Step 3: Fetch updated stock from FM
+        self.logger.info(f"  [{sku}] Step 3/4: Fetching updated stock from FM")
+        new_quantity = self.fm.get_stock(sku)
+        self.logger.info(f"  [{sku}] FM Inventario = {new_quantity}")
+
+        # Step 4: Update Shopify inventory
+        self.logger.info(f"  [{sku}] Step 4/4: Updating Shopify inventory → {new_quantity}")
+        self.shopify.update_inventory(sku, new_quantity)
+
+        self.logger.info(
+            f"  [{sku}] ✓ Restocked — {title}: Shopify stock set to {new_quantity}"
+        )
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 

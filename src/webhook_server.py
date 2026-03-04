@@ -220,6 +220,107 @@ async def shopify_order_webhook(request: Request, background_tasks: BackgroundTa
 
 
 # ------------------------------------------------------------------
+# Shopify refund webhook
+# ------------------------------------------------------------------
+
+# Separate idempotency set for refunds (refund IDs ≠ order IDs)
+_processed_refunds: OrderedDict = OrderedDict()
+_refund_lock = threading.Lock()
+
+
+def _mark_refund_processed(refund_id: int) -> bool:
+    """Mark a refund as processed.  Returns True if it was NEW."""
+    with _refund_lock:
+        if refund_id in _processed_refunds:
+            return False
+        _processed_refunds[refund_id] = True
+        while len(_processed_refunds) > _MAX_PROCESSED:
+            _processed_refunds.popitem(last=False)
+        return True
+
+
+async def process_refund_in_background(webhook_data: Dict[str, Any]):
+    """Process refund webhook in background."""
+    try:
+        with ShopifySyncService() as sync_service:
+            result = sync_service.process_refund_webhook(webhook_data)
+
+            if result["success"]:
+                logger.info(
+                    f"Background refund processing completed: refund {result['refund_id']} — "
+                    f"{result['items_processed']} items restocked"
+                )
+            else:
+                logger.warning(
+                    f"Background refund processing completed with errors: refund {result['refund_id']}"
+                )
+
+    except Exception as e:
+        logger.error(f"Background refund processing failed: {str(e)}", exc_info=True)
+
+
+@app.post("/webhooks/shopify/refunds")
+async def shopify_refund_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receive and process Shopify refund webhooks.
+
+    Restocks items in FileMaker when a refund is created with
+    restock_type 'return' or 'cancel'.
+    """
+    body = await request.body()
+
+    signature = request.headers.get("X-Shopify-Hmac-SHA256")
+    shop_domain = request.headers.get("X-Shopify-Shop-Domain")
+    topic = request.headers.get("X-Shopify-Topic")
+
+    logger.info(f"Received webhook: {topic} from {shop_domain}")
+
+    # ── Validate webhook signature ────────────────────────────────────
+    try:
+        webhook_validator.validate_signature(body, signature)
+        webhook_validator.validate_shopify_domain(shop_domain)
+    except WebhookValidationError as e:
+        logger.error(f"Webhook validation failed: {e.message}")
+        raise HTTPException(status_code=401, detail=e.message)
+
+    # ── Parse webhook data ────────────────────────────────────────────
+    try:
+        webhook_data = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in refund webhook: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    refund_id = webhook_data.get("id")
+    order_id = webhook_data.get("order_id")
+    logger.info(f"Processing refund: {refund_id} (order: {order_id})")
+
+    # ── Idempotency check ─────────────────────────────────────────────
+    if not _mark_refund_processed(refund_id):
+        logger.info(f"DUPLICATE — refund {refund_id} already processed, skipping")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "duplicate",
+                "refund_id": refund_id,
+                "message": "Refund already processed (duplicate webhook)"
+            }
+        )
+
+    # Process refund in background
+    background_tasks.add_task(process_refund_in_background, webhook_data)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "accepted",
+            "refund_id": refund_id,
+            "order_id": order_id,
+            "message": "Refund webhook received and queued for processing"
+        }
+    )
+
+
+# ------------------------------------------------------------------
 # Test endpoint (development only)
 # ------------------------------------------------------------------
 

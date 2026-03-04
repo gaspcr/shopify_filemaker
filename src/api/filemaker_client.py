@@ -473,6 +473,60 @@ class FileMakerClient(BaseClient):
 
         self.logger.info(f"Movement record created for SKU {sku} (salida: {quantity_out})")
 
+    def create_entry_movement(self, sku: str, quantity_in: int) -> None:
+        """
+        Create a stock entry (entrada) movement record in FileMaker.
+
+        Used for refunds/returns — restocks items back into inventory.
+
+        POST .../layouts/MovimientoStock_dapi/records
+        Body: {"fieldData": {"Concepto Cobro_fk": sku,
+                             "Inv_Cant_Salida": 0,
+                             "Inv_Cant_Entrada": quantity_in}}
+
+        Args:
+            sku: Conceptos Cobro_pk.
+            quantity_in: Number of units being returned (positive integer).
+
+        Raises:
+            FileMakerAPIError: If record creation fails.
+        """
+        endpoint = (
+            f"/fmi/data/v1/databases/{self.database}"
+            f"/layouts/{MOVEMENTS_LAYOUT}/records"
+        )
+        payload = {
+            "fieldData": {
+                "Concepto Cobro_fk": int(sku),
+                "Inv_Cant_Salida": 0,
+                "Inv_Cant_Entrada": quantity_in,
+            }
+        }
+
+        try:
+            response = self._fm_request("POST", endpoint, json=payload)
+        except httpx.HTTPError as e:
+            raise FileMakerAPIError(
+                f"Network error creating entry movement for SKU {sku}: {str(e)}",
+                details={"sku": sku, "error": str(e)},
+            )
+
+        if response.status_code != 200:
+            raise FileMakerAPIError(
+                f"HTTP {response.status_code} creating entry movement for SKU {sku}",
+                details={"sku": sku, "response": response.text},
+            )
+
+        data = response.json()
+        code = _fm_code(data)
+        if code != "0":
+            raise FileMakerAPIError(
+                f"FM error creating entry movement for SKU {sku}: {_fm_message(data)}",
+                details={"code": code},
+            )
+
+        self.logger.info(f"Entry movement record created for SKU {sku} (entrada: {quantity_in})")
+
     # ------------------------------------------------------------------
     # Legacy stock retrieval (still used internally)
     # ------------------------------------------------------------------
